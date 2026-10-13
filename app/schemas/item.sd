@@ -1,0 +1,67 @@
+schema item {
+
+    document item {
+
+        field category type int {
+            indexing: attribute
+            attribute: fast-search
+        }
+
+        field shade type int {
+            indexing: attribute
+            attribute: fast-search
+        }
+
+        field title type string {
+            indexing: index
+        }
+
+        field popularity type float {
+            indexing: attribute
+        }
+
+        field embedding type tensor<bfloat16>(x[512]) {
+            indexing: attribute | index
+            attribute {
+                distance-metric: angular
+            }
+            index {
+                hnsw {
+                    max-links-per-node: 8
+                    neighbors-to-explore-at-insert: 32
+                }
+            }
+        }
+    }
+
+    rank-profile rerank_uses_nn {
+        inputs {
+            query(q) tensor<bfloat16>(x[512])
+        }
+        num-threads-per-search: 4
+
+        first-phase {
+            expression: attribute(popularity)
+        }
+
+        second-phase {
+            expression: firstPhase + closeness(label, nn)
+            rerank-count: 100
+        }
+
+        match-features {
+            closeness(label, nn)
+        }
+    }
+
+    rank-profile rerank_ignores_nn inherits rerank_uses_nn {
+        second-phase {
+            expression: firstPhase * 2
+            rerank-count: 100
+        }
+
+        match-features {
+            attribute(popularity)
+        }
+    }
+}

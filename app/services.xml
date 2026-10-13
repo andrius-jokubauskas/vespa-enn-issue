@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<services version="1.0">
+
+    <container id="default" version="1.0">
+        <search/>
+        <document-api/>
+    </container>
+
+    <content id="items" version="1.0">
+        <redundancy>1</redundancy>
+        <documents>
+            <document type="item" mode="index"/>
+        </documents>
+        <nodes>
+            <node hostalias="node1" distribution-key="0"/>
+        </nodes>
+        <engine>
+            <proton>
+                <tuning>
+                    <searchnode>
+                        <requestthreads>
+                            <persearch>4</persearch>
+                        </requestthreads>
+                    </searchnode>
+                </tuning>
+            </proton>
+        </engine>
+    </content>
+
+</services>
