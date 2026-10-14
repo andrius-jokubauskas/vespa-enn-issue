@@ -161,31 +161,55 @@ Docker on an 8-core laptop, median of 9 runs:
 - With `rerankCount=100`: 1 thread → 3×, 2 threads → 4×, 4 threads → 6×. That's 2 + threads.
 - `rerank_ignores_nn` (no NN feature anywhere) pays the same.
 
-## Proposed fix
+## Possible fixes
 
-Create the exact iterator **non-strict** in later phases. Those phases only ask about docids that
-first phase already produced, so a non-strict seek computes the distance for exactly that document
-and answers match / no match:
+**Expected cost after a fix:** 1 brute-force pass, plus one distance per reranked document and
+per returned hit. Today it is (2 + threads) passes.
+
+### Not safe: make only the exact iterator non-strict
 
 ```diff
      return ExactNearestNeighborIterator::create(
 -        _eval_stats, strict(), tfmd,
 +        _eval_stats, strict() && _matching_phase == MatchingPhase::FIRST_PHASE, tfmd,
-         std::make_unique<search::tensor::DistanceCalculator>(_attr_tensor, _query_tensor), _distance_heap,
-         *_global_filter, _matching_phase != MatchingPhase::FIRST_PHASE);
 ```
 
-**Why the result does not change.** Since [#31562](https://github.com/vespa-engine/vespa/pull/31562),
-later phases use a read-only heap with the original `distanceThreshold`. For any requested docid,
-a strict seek either lands on that docid (within the threshold) or moves past it. A non-strict seek
-returns "match" or "no match" for the same docid with the same test. Only the scanning between
-requested docids goes away.
+This looks like a one-line fix, but strictness is a contract for the whole tree. A strict parent
+assumes its children are strict
+([orlikesearch.h#L43](https://github.com/vespa-engine/vespa/blob/v8.763.13/searchlib/src/vespa/searchlib/queryeval/orlikesearch.h#L43)).
+When a non-strict NN leaf misses, it stays behind the requested docid:
 
-**Expected cost after the fix:** 1 brute-force pass, plus one distance per reranked document and
-per returned hit. Today it is (2 + threads) passes.
+- `StrictHeapOrSearch::doSeek`, the default strict OR, keeps seeking the same child in
+  `while (_child_docid[front] < docid)`
+  ([orlikesearch.h#L115-L120](https://github.com/vespa-engine/vespa/blob/v8.763.13/searchlib/src/vespa/searchlib/queryeval/orlikesearch.h#L115-L120)),
+  which never ends. That is the OR in the repro query.
+- `AndSearchStrict::advance` with the NN as first child doesn't move forward either
+  ([andsearchstrict.h#L61-L62](https://github.com/vespa-engine/vespa/blob/v8.763.13/searchlib/src/vespa/searchlib/queryeval/andsearchstrict.h#L61-L62)).
 
-**An alternative with the same effect:** in `ExactNearestNeighborImpl::doSeek`, do not loop when
-the heap is read-only (later phases).
+### Option 1: build the whole later-phase iterator tree non-strict
 
-We have not built a patched Vespa to measure the fix. We are happy to test a build against this
-repro.
+- Second phase and match-features only call `initRange` and then `unpack(docid)` on the root, for
+  known docids in increasing order
+  ([document_scorer.h#L33-L36](https://github.com/vespa-engine/vespa/blob/v8.763.13/searchcore/src/vespa/searchcore/proton/matching/document_scorer.h#L33-L36),
+  [extract_features.cpp#L47-L53](https://github.com/vespa-engine/vespa/blob/v8.763.13/searchcore/src/vespa/searchcore/proton/matching/extract_features.cpp#L47-L53)).
+  They never use the root's "next hit", so they don't need strict iterators.
+- A non-strict iterator gives the same match / no-match answer for a given docid, and every parent
+  accepts non-strict children.
+- Open questions: strictness is resolved once on the blueprint
+  ([#30814](https://github.com/vespa-engine/vespa/pull/30814)), so later phases need their own
+  non-strict pass or flag. Iterators that keep state between seeks (WAND, limiters, the NN heap)
+  need the same review as in [#25880](https://github.com/vespa-engine/vespa/pull/25880).
+
+### Option 2: keep the exact iterator strict, make its later-phase seeks cheap
+
+- For example, first phase records in a bit vector which docids later phases would match, and
+  later phases seek to the next set bit. This stays inside the NN code.
+- The recorded set must equal what later phases match today (`distanceLimit()` of the read-only
+  heap, [#31562](https://github.com/vespa-engine/vespa/pull/31562)), not the first-phase hits,
+  because the first-phase limit tightens as the heap fills.
+- First-phase threads would need to share or merge the bit vector.
+
+### Checking a fix
+
+The "÷ filter hits" column should drop to about 1× for every row, and hits, scores and
+match-features must be identical to the stock image. We have not built a patched Vespa yet.
